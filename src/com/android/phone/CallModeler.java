@@ -30,8 +30,10 @@ import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
 import com.android.internal.telephony.TelephonyCapabilities;
 import com.android.internal.telephony.cdma.CdmaCallWaitingNotification;
+import com.android.internal.telephony.gsm.SuppServiceNotification;
 import com.android.phone.CallGatewayManager.RawGatewayInfo;
 import com.android.services.telephony.common.Call;
+import com.android.services.telephony.common.CallDetails;
 import com.android.services.telephony.common.Call.Capabilities;
 import com.android.services.telephony.common.Call.State;
 
@@ -41,6 +43,7 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Lists;
 
+import java.sql.Array;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -93,6 +96,7 @@ public class CallModeler extends Handler {
     private final ArrayList<Listener> mListeners = new ArrayList<Listener>();
     private Connection mCdmaIncomingConnection;
     private Connection mCdmaOutgoingConnection;
+    private SuppServiceNotification mSuppSvcNotification;
 
     public CallModeler(CallStateMonitor callStateMonitor, CallManager callManager,
             CallGatewayManager callGatewayManager) {
@@ -121,6 +125,17 @@ public class CallModeler extends Handler {
                 break;
             case CallStateMonitor.PHONE_ON_DIAL_CHARS:
                 onPostDialChars((AsyncResult) msg.obj, (char) msg.arg1);
+                break;
+            case CallStateMonitor.PHONE_SUPP_SERVICE_NOTIFY:
+                if (DBG) Log.d(TAG, "Received Supplementary Notification");
+
+                if (msg.obj != null && ((AsyncResult) msg.obj).result != null) {
+                    mSuppSvcNotification =
+                            (SuppServiceNotification)(((AsyncResult) msg.obj).result);
+                }
+                break;
+            case CallStateMonitor.PHONE_ACTIVE_SUBSCRIPTION_CHANGE:
+                onActiveSubChanged((AsyncResult) msg.obj);
                 break;
             default:
                 break;
@@ -303,6 +318,15 @@ public class CallModeler extends Handler {
         return call;
     }
 
+    /* package */void onUnsolCallModify(Connection conn) {
+        final Call call = getCallFromMap(mCallMap, conn, false);
+        copyDetails(conn.getCallModify().call_details, call.getCallModifyDetails(),
+                conn.getCallModify().error + "");
+        for (int i = 0; i < mListeners.size(); i++) {
+            mListeners.get(i).onModifyCall(call);
+        }
+    }
+
     private void onDisconnect(Connection conn) {
         Log.i(TAG, "onDisconnect");
         final Call call = getCallFromMap(mCallMap, conn, false);
@@ -311,6 +335,7 @@ public class CallModeler extends Handler {
             final boolean wasConferenced = call.getState() == State.CONFERENCED;
 
             updateCallFromConnection(call, conn, false);
+            updateSsNotificationData(call);
 
             for (int i = 0; i < mListeners.size(); ++i) {
                 mListeners.get(i).onDisconnect(call);
@@ -406,6 +431,10 @@ public class CallModeler extends Handler {
             }
 
         }
+
+        //Cleanup local connections/Calls which are not present in CallManager.
+        cleanupOrphanCalls(mCallMap, telephonyCalls, out);
+        cleanupOrphanCalls(mConfCallMap, telephonyCalls, out);
     }
 
     /**
@@ -499,6 +528,46 @@ public class CallModeler extends Handler {
         call.setState(newState);
     }
 
+    private void mapCallDetails(Call call, Connection connection) {
+        copyDetails(connection.getCallDetails(), call.getCallDetails(), connection.errorInfo);
+
+        if (connection.getCallModify() != null) {
+            copyDetails(connection.getCallModify().call_details, call.getCallModifyDetails(),
+                    connection.errorInfo);
+        }
+
+        if (connection.getCall().getConfUriList() != null) {
+            String[] confList = connection.getCall().getConfUriList();
+            call.getCallDetails().setConfUriList(confList);
+        }
+
+        call.getCallDetails().setMpty(connection.getCall().isMultiparty());
+    }
+
+    /**
+     * copy CallDetails of connection to CallDetails of Call
+     * @param src
+     * @param dest
+     * @param errorInfo
+     */
+    private void copyDetails(com.android.internal.telephony.CallDetails src,
+            com.android.services.telephony.common.CallDetails dest, String errorInfo) {
+        dest.setCallType(src.call_type);
+        dest.setCallDomain(src.call_domain);
+        dest.setExtras(src.extras);
+        dest.setErrorInfo(errorInfo);
+    }
+
+    /**
+     * To copy calldetails of callmodify object from Connection to
+     * ModifyCallDetails of Call object
+     * @param callDetails
+     * @param conn
+     */
+    public void copyDetails(CallDetails callDetails, Connection conn) {
+        conn.getCallModify().call_details.call_type = callDetails.getCallType();
+    }
+
     /**
      * Updates the Call properties to match the state of the connection object
      * that it represents.
@@ -517,6 +586,8 @@ public class CallModeler extends Handler {
             setNewState(call, newState, connection);
             changed = true;
         }
+
+        mapCallDetails(call, connection);
 
         final Call.DisconnectCause newDisconnectCause =
                 translateDisconnectCauseFromTelephony(connection.getDisconnectCause());
@@ -609,6 +680,8 @@ public class CallModeler extends Handler {
         boolean canSwapCall = false;
         boolean canRespondViaText = false;
         boolean canMute = false;
+        boolean canAddParticipant = false;
+        boolean canModifyCall = false;
 
         final boolean supportHold = PhoneUtils.okToSupportHold(mCallManager);
         final boolean canHold = (supportHold ? PhoneUtils.okToHoldCall(mCallManager) : false);
@@ -619,9 +692,11 @@ public class CallModeler extends Handler {
         if (callIsActive) {
             canMergeCall = PhoneUtils.okToMergeCalls(mCallManager);
             canSwapCall = PhoneUtils.okToSwapCalls(mCallManager);
+            canModifyCall = PhoneUtils.isVTModifyAllowed(connection);
         }
 
         canAddCall = PhoneUtils.okToAddCall(mCallManager);
+        canAddParticipant = PhoneUtils.isCallOnImsEnabled() && canAddCall;
 
         // "Mute": only enabled when the foreground call is ACTIVE.
         // (It's meaningless while on hold, or while DIALING/ALERTING.)
@@ -670,10 +745,15 @@ public class CallModeler extends Handler {
         if (canMute) {
             retval |= Capabilities.MUTE;
         }
+        if (canAddParticipant) {
+            retval |= Capabilities.ADD_PARTICIPANT;
+        }
         if (genericConf) {
             retval |= Capabilities.GENERIC_CONFERENCE;
         }
-
+        if (canModifyCall) {
+            retval |= Capabilities.MODIFY_CALL;
+        }
         return retval;
     }
 
@@ -683,21 +763,27 @@ public class CallModeler extends Handler {
      * checking to see if more than one of it's children is alive.
      */
     private boolean isPartOfLiveConferenceCall(Connection connection) {
+        boolean ret = false;
         if (connection.getCall() != null && connection.getCall().isMultiparty()) {
             int count = 0;
-            for (Connection currConn : connection.getCall().getConnections()) {
-
-                // Only count connections which are alive and never cound the special
-                // "dialing" 3way call for CDMA calls.
-                if (currConn.isAlive() && currConn != mCdmaOutgoingConnection) {
-                    count++;
-                    if (count >= 2) {
-                        return true;
+            if (connection.getCallDetails().call_domain
+                    == com.android.services.telephony.common.CallDetails.CALL_DOMAIN_PS) {
+                ret = true;
+            } else {
+                for (Connection currConn : connection.getCall().getConnections()) {
+                    // Only count connections which are alive and never cound
+                    // the special
+                    // "dialing" 3way call for CDMA calls.
+                    if (currConn.isAlive() && currConn != mCdmaOutgoingConnection) {
+                        count++;
+                        if (count >= 2) {
+                            return true;
+                        }
                     }
                 }
             }
         }
-        return false;
+        return ret;
     }
 
     private int translateStateFromTelephony(Connection connection, boolean isForConference) {
@@ -750,6 +836,19 @@ public class CallModeler extends Handler {
         }
 
         return retval;
+    }
+
+
+    /**
+     * Called when the active subscription changes.
+     */
+    private void onActiveSubChanged(AsyncResult r) {
+        int activeSub = (Integer) r.result;
+        Log.i(TAG, "onActiveSubChanged: " + activeSub);
+
+        for (int i = 0; i < mListeners.size(); ++i) {
+            mListeners.get(i).onActiveSubChanged(activeSub);
+        }
     }
 
     private final ImmutableMap<Connection.DisconnectCause, Call.DisconnectCause> CAUSE_MAP =
@@ -807,6 +906,12 @@ public class CallModeler extends Handler {
                 .put(Connection.DisconnectCause.TIMED_OUT, Call.DisconnectCause.TIMED_OUT)
                 .put(Connection.DisconnectCause.UNOBTAINABLE_NUMBER,
                         Call.DisconnectCause.UNOBTAINABLE_NUMBER)
+                .put(Connection.DisconnectCause.DIAL_MODIFIED_TO_USSD,
+                        Call.DisconnectCause.DIAL_MODIFIED_TO_USSD)
+                .put(Connection.DisconnectCause.DIAL_MODIFIED_TO_SS,
+                        Call.DisconnectCause.DIAL_MODIFIED_TO_SS)
+                .put(Connection.DisconnectCause.DIAL_MODIFIED_TO_DIAL,
+                        Call.DisconnectCause.DIAL_MODIFIED_TO_DIAL)
                 .build();
 
     private Call.DisconnectCause translateDisconnectCauseFromTelephony(
@@ -862,6 +967,60 @@ public class CallModeler extends Handler {
     }
 
     /**
+     * Updates Call object with last received SuppServNotification.
+     */
+    private void updateSsNotificationData(Call call) {
+        if (call != null && mSuppSvcNotification != null) {
+            Call.SsNotification ssNotification = new Call.SsNotification();
+            ssNotification.notificationType = mSuppSvcNotification.notificationType;
+            ssNotification.code = mSuppSvcNotification.code;
+            ssNotification.index = mSuppSvcNotification.index;
+            ssNotification.type = mSuppSvcNotification.type;
+            ssNotification.number = mSuppSvcNotification.number;
+            call.setSuppServNotification(ssNotification);
+            mSuppSvcNotification = null;
+        }
+    }
+
+
+    /**
+     * Sometimes (like in case of radio tech change during emergency call)
+     * Connection objects below CallManager, gets disposed and recreated
+     * without a DISCONNECT event reaching CallManager and upper layers.
+     * CallManager retrieves the current calls/connections from active phones
+     * after radio tech change.
+     * Cleanup local connections/Calls in TeleService which are not present
+     * in CallManager.
+     */
+    private void cleanupOrphanCalls(HashMap<Connection, Call> callMap,
+            final List<com.android.internal.telephony.Call> telephonyCalls,
+            List<Call> out) {
+        List<Connection> orphanConns = new ArrayList<Connection>();
+        for (Connection conn: callMap.keySet()) {
+            boolean found = false;
+            for (com.android.internal.telephony.Call telephonyCall : telephonyCalls) {
+                if (telephonyCall.hasConnection(conn)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                orphanConns.add(conn);
+            }
+        }
+
+        for (Connection conn: orphanConns) {
+            Call call = getCallFromMap(callMap, conn, false);
+            if (call != null) {
+                Log.i(TAG, "Cleaning up an orphan call: " + call);
+                callMap.remove(conn);
+                call.setState(State.IDLE);
+                if (out != null) out.add(call);
+            }
+        }
+    }
+
+    /**
      * Listener interface for changes to Calls.
      */
     public interface Listener {
@@ -870,6 +1029,8 @@ public class CallModeler extends Handler {
         void onUpdate(List<Call> calls);
         void onPostDialAction(Connection.PostDialState state, int callId, String remainingChars,
                 char c);
+        void onActiveSubChanged(int activeSub);
+        void onModifyCall(Call call);
     }
 
     /**
